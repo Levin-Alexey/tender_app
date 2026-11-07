@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -20,5 +19,3 @@ cleanup() {
     wait "$WORKER_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
-
-wait -n "$API_PID" "$WORKER_PID"
