@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import tempfile
+import uuid
+import logging
 from pathlib import Path
 import mimetypes
 import urllib.parse
@@ -14,30 +16,32 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 import asyncpg
 import boto3
+from dotenv import load_dotenv
+
+from database import create_database_pool
+
+load_dotenv()
 
 # Настройки
-DATABASE_URL = os.getenv("DATABASE_URL", "")
 CLOUDAMQP_URL = os.getenv("CLOUDAMQP_URL", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 UNSTRUCTURED_API_KEY = os.getenv("UNSTRUCTURED_API_KEY", "")
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
+S3_REGION = os.getenv("S3_REGION", "us-east-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+S3_PUBLIC_URL_PREFIX = os.getenv("S3_PUBLIC_URL_PREFIX", "").rstrip("/")
+logger = logging.getLogger(__name__)
 
 UNSTRUCTURED_API_URL = os.getenv("UNSTRUCTURED_API_URL", "https://api.unstructuredapp.io/general/v0/general").strip()
 
 if UNSTRUCTURED_API_URL.startswith("https://api.unstructured.io"):
     UNSTRUCTURED_API_URL = UNSTRUCTURED_API_URL.replace("https://api.unstructured.io", "https://api.unstructuredapp.io", 1)
 
-# Настройки S3 (для загрузки Excel смет вместо Supabase Storage)
-s3_client = boto3.client(
-    's3',
-    endpoint_url=os.getenv("S3_ENDPOINT_URL"),
-    aws_access_key_id=os.getenv("S3_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("S3_SECRET_KEY")
-)
-S3_BUCKET = os.getenv("S3_BUCKET", "tenders")
-S3_PUBLIC_URL_PREFIX = os.getenv("S3_PUBLIC_URL_PREFIX", "").rstrip("/")
-
 # Глобальный пул БД
-DB_POOL = None
+DB_POOL: asyncpg.Pool | None = None
+S3_CLIENT = None
 
 def _parse_llm_json(raw_text: str) -> dict:
     try:
@@ -304,15 +308,55 @@ async def download_file(url: str, temp_dir: str) -> str:
         with open(path, "wb") as f: f.write(resp.content)
         return path
 
-# --- ЗАГРУЗКА EXCEL В S3 ---
-def upload_excel_to_s3(file_path: str, filename: str) -> str:
-    s3_client.upload_file(
-        file_path, 
-        S3_BUCKET, 
-        filename, 
-        ExtraArgs={'ContentType': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
+def get_s3_client():
+    global S3_CLIENT
+    if S3_CLIENT is None:
+        missing = [
+            name
+            for name, value in (
+                ("S3_ENDPOINT_URL", S3_ENDPOINT_URL),
+                ("S3_ACCESS_KEY", S3_ACCESS_KEY),
+                ("S3_SECRET_KEY", S3_SECRET_KEY),
+                ("S3_BUCKET", S3_BUCKET),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(f"Missing S3 configuration: {', '.join(missing)}")
+        S3_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT_URL,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            region_name=S3_REGION,
+        )
+    return S3_CLIENT
+
+
+def upload_file_to_s3(file_path: str, object_key: str, content_type: str) -> str:
+    client = get_s3_client()
+    client.upload_file(
+        file_path,
+        S3_BUCKET,
+        object_key,
+        ExtraArgs={"ContentType": content_type},
     )
-    return f"{S3_PUBLIC_URL_PREFIX}/{filename}"
+    if S3_PUBLIC_URL_PREFIX:
+        return f"{S3_PUBLIC_URL_PREFIX}/{urllib.parse.quote(object_key, safe='/')}"
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": object_key},
+        ExpiresIn=86400,
+    )
+
+
+def upload_excel_to_s3(file_path: str, task_id: uuid.UUID) -> str:
+    filename = f"Karta_Dannyh_Tendera_{str(task_id)[:8]}.xlsx"
+    object_key = f"reports/{task_id}/{filename}"
+    content_type = (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    return upload_file_to_s3(file_path, object_key, content_type)
 
 def _normalize_tender_fact(fact, parameter: str) -> dict:
     fact = fact if isinstance(fact, dict) else {}
@@ -439,18 +483,38 @@ def _normalize_extracted_data(raw):
     return {}
 
 async def finalize_task_if_ready(task_id: str, mode: str):
+    task_uuid = uuid.UUID(task_id)
     async with DB_POOL.acquire() as conn:
-        docs = await conn.fetch("SELECT document_name, status, extracted_data::text FROM documents WHERE task_id = $1", task_id)
-        if any(d["status"] in ("pending", "processing", "error") for d in docs): return
-        
+        docs = await conn.fetch(
+            """
+            SELECT document_name, status, extracted_data::text
+            FROM documents
+            WHERE task_id = $1
+            """,
+            task_uuid,
+        )
+        if not docs:
+            raise RuntimeError(f"По task_id={task_id} не найдено документов")
+        if any(
+            document["status"] in ("pending", "processing", "error")
+            for document in docs
+        ):
+            return
+
         extracted_by_doc = []
         for doc in docs:
             parsed_data = _normalize_extracted_data(doc.get("extracted_data"))
             text = parsed_data.get("parsed_text", "")
-            if not text: raise RuntimeError(f"У документа отсутствует parsed_text")
+            if not text:
+                raise RuntimeError(
+                    f"У документа '{doc['document_name']}' отсутствует parsed_text"
+                )
             extracted_by_doc.append((doc.get("document_name", "Unknown"), text))
 
-    combined_text = "".join(f"\n\n{'='*30}\nДОКУМЕНТ: {doc_name}\n{'='*30}\n\n{text}" for doc_name, text in extracted_by_doc)
+    combined_text = "".join(
+        f"\n\n{'=' * 30}\nДОКУМЕНТ: {doc_name}\n{'=' * 30}\n\n{text}"
+        for doc_name, text in extracted_by_doc
+    )
 
     if mode == "analytics":
         final_result = await analyze_text_with_deepseek_analytics(combined_text)
@@ -458,74 +522,253 @@ async def finalize_task_if_ready(task_id: str, mode: str):
         raw_tender_data = await extract_tender_data_for_estimator(combined_text)
         final_result = normalize_tender_data(raw_tender_data)
         final_result["report_type"] = "tender_data_map"
-        final_result["report_note"] = "Карта исходных данных для ручного расчета сметчиком. Финансовый расчет не выполнялся."
+        final_result["report_note"] = (
+            "Карта исходных данных для ручного расчета сметчиком. "
+            "Финансовый расчет не выполнялся."
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
-            excel_path = await asyncio.to_thread(create_tender_data_report, final_result, temp_dir, task_id)
-            final_result["excel_download_url"] = await asyncio.to_thread(upload_excel_to_s3, excel_path, f"Karta_Dannyh_Tendera_{task_id[:8]}.xlsx")
-    else: raise RuntimeError(f"Неизвестный режим: {mode}")
+            excel_path = await asyncio.to_thread(
+                create_tender_data_report, final_result, temp_dir, task_id
+            )
+            final_result["excel_download_url"] = await asyncio.to_thread(
+                upload_excel_to_s3, excel_path, task_uuid
+            )
+    else:
+        raise RuntimeError(f"Неизвестный режим: {mode}")
 
     async with DB_POOL.acquire() as conn:
-        await conn.execute("UPDATE documents SET status = 'completed', extracted_data = $1::jsonb WHERE task_id = $2", json.dumps({"final_result": final_result, "stage": "finalized"}), task_id)
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE documents
+                SET status = 'completed', extracted_data = $1::jsonb
+                WHERE task_id = $2
+                """,
+                json.dumps(
+                    {"final_result": final_result, "stage": "finalized"},
+                    ensure_ascii=False,
+                ),
+                task_uuid,
+            )
+            await conn.execute(
+                """
+                UPDATE calculations
+                SET status = 'completed'
+                WHERE id = (
+                    SELECT calculation_id FROM documents
+                    WHERE task_id = $1 LIMIT 1
+                )
+                """,
+                task_uuid,
+            )
 
 async def process_message(message: aio_pika.IncomingMessage):
     async with message.process(requeue=True, reject_on_redelivered=True):
         body = json.loads(message.body.decode())
-        task_id, mode = body.get("task_id"), body.get("mode", "analytics")
-        if not task_id: raise RuntimeError("Некорректное сообщение: нет task_id")
+        task_id = body.get("task_id")
+        if not task_id:
+            raise RuntimeError("Некорректное сообщение: нет task_id")
+        try:
+            task_uuid = uuid.UUID(str(task_id))
+        except ValueError as error:
+            raise RuntimeError("Некорректное сообщение: некорректный task_id") from error
+        mode = body.get("mode", "analytics")
 
         try:
             async with DB_POOL.acquire() as conn:
-                docs = await conn.fetch("SELECT id, document_url, document_name FROM documents WHERE task_id = $1", task_id)
-            if not docs: raise RuntimeError(f"По task_id={task_id} не найдено документов")
-            
+                docs = await conn.fetch(
+                    """
+                    SELECT id, document_url, document_name
+                    FROM documents
+                    WHERE task_id = $1
+                    ORDER BY created_at, id
+                    """,
+                    task_uuid,
+                )
+            if not docs:
+                raise RuntimeError(f"По task_id={task_id} не найдено документов")
+
             failed_docs = 0
             with tempfile.TemporaryDirectory() as temp_dir:
                 downloaded = []
                 for doc in docs:
-                    async with DB_POOL.acquire() as conn: await conn.execute("UPDATE documents SET status = 'processing', extracted_data = $1::jsonb WHERE id = $2", json.dumps({"stage": "downloading"}), doc["id"])
+                    async with DB_POOL.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE documents
+                            SET status = 'processing', extracted_data = $1::jsonb
+                            WHERE id = $2
+                            """,
+                            json.dumps({"stage": "downloading"}),
+                            doc["id"],
+                        )
                     try:
                         sub_dir = os.path.join(temp_dir, str(doc["id"]))
                         os.makedirs(sub_dir, exist_ok=True)
                         file_path = await download_file(doc["document_url"], sub_dir)
+                        filename = Path(file_path).name
+                        object_key = (
+                            f"sources/{task_uuid}/{doc['id']}/{filename}"
+                        )
+                        mime_type = (
+                            mimetypes.guess_type(filename)[0]
+                            or "application/octet-stream"
+                        )
+                        await asyncio.to_thread(
+                            upload_file_to_s3,
+                            file_path,
+                            object_key,
+                            mime_type,
+                        )
+                        async with DB_POOL.acquire() as conn:
+                            await conn.execute(
+                                """
+                                UPDATE documents
+                                SET source_object_key = $1
+                                WHERE id = $2
+                                """,
+                                object_key,
+                                doc["id"],
+                            )
                         downloaded.append((doc["id"], doc["document_name"], file_path))
                     except Exception as doc_error:
                         failed_docs += 1
-                        async with DB_POOL.acquire() as conn: await conn.execute("UPDATE documents SET status = 'error', extracted_data = $1::jsonb WHERE id = $2", json.dumps({"error": str(doc_error)}), doc["id"])
+                        logger.exception(
+                            "Could not download or store source document id=%s",
+                            doc["id"],
+                        )
+                        async with DB_POOL.acquire() as conn:
+                            await conn.execute(
+                                """
+                                UPDATE documents
+                                SET status = 'error', extracted_data = $1::jsonb
+                                WHERE id = $2
+                                """,
+                                json.dumps({"error": str(doc_error)}),
+                                doc["id"],
+                            )
 
                 semaphore = asyncio.Semaphore(3)
+
                 async def parse_doc(doc_id, doc_name, file_path):
                     async with semaphore:
                         try:
-                            async with DB_POOL.acquire() as conn: await conn.execute("UPDATE documents SET status = 'processing', extracted_data = $1::jsonb WHERE id = $2", json.dumps({"stage": "parsing"}), doc_id)
+                            async with DB_POOL.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE documents
+                                    SET status = 'processing', extracted_data = $1::jsonb
+                                    WHERE id = $2
+                                    """,
+                                    json.dumps({"stage": "parsing"}),
+                                    doc_id,
+                                )
                             ext = Path(file_path).suffix.lower()
-                            if ext in [".xlsx", ".xls"]: text = await asyncio.to_thread(extract_text_from_excel, file_path)
-                            else: text = await call_smart_parser(file_path)
-                            async with DB_POOL.acquire() as conn: await conn.execute("UPDATE documents SET status = 'completed', extracted_data = $1::jsonb WHERE id = $2", json.dumps({"stage": "parsed", "parsed_text": text, "source_file": os.path.basename(file_path), "document_name": doc_name}), doc_id)
+                            if ext in [".xlsx", ".xls"]:
+                                text = await asyncio.to_thread(
+                                    extract_text_from_excel, file_path
+                                )
+                            else:
+                                text = await call_smart_parser(file_path)
+                            async with DB_POOL.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE documents
+                                    SET status = 'completed', extracted_data = $1::jsonb
+                                    WHERE id = $2
+                                    """,
+                                    json.dumps(
+                                        {
+                                            "stage": "parsed",
+                                            "parsed_text": text,
+                                            "source_file": os.path.basename(file_path),
+                                            "document_name": doc_name,
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    doc_id,
+                                )
                             return True
                         except Exception as doc_error:
-                            async with DB_POOL.acquire() as conn: await conn.execute("UPDATE documents SET status = 'error', extracted_data = $1::jsonb WHERE id = $2", json.dumps({"error": str(doc_error)}), doc_id)
+                            logger.exception(
+                                "Could not parse source document id=%s", doc_id
+                            )
+                            async with DB_POOL.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    UPDATE documents
+                                    SET status = 'error', extracted_data = $1::jsonb
+                                    WHERE id = $2
+                                    """,
+                                    json.dumps({"error": str(doc_error)}),
+                                    doc_id,
+                                )
                             return False
 
                 results = await asyncio.gather(*(parse_doc(*item) for item in downloaded))
                 failed_docs += results.count(False)
 
-            if failed_docs: return
+            if failed_docs:
+                async with DB_POOL.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE calculations
+                        SET status = 'error'
+                        WHERE id = (
+                            SELECT calculation_id FROM documents
+                            WHERE task_id = $1 LIMIT 1
+                        )
+                        """,
+                        task_uuid,
+                    )
+                return
             await finalize_task_if_ready(task_id, mode)
         except Exception as e:
             error_msg = str(e)
-            if "ReadTimeout" in error_msg or "timeout" in error_msg.lower(): error_msg = "Пакет документов слишком тяжелый. Сервер парсинга не смог прочитать документы за 15 минут. Вырежи лишние страницы из ТЗ."
-            async with DB_POOL.acquire() as conn: await conn.execute("UPDATE documents SET status = 'error', extracted_data = $1::jsonb WHERE task_id = $2", json.dumps({"error": error_msg}), task_id)
+            if "ReadTimeout" in error_msg or "timeout" in error_msg.lower():
+                error_msg = (
+                    "Превышено время ожидания обработки документа. "
+                    "Проверьте размер файла и повторите попытку."
+                )
+            logger.exception("Could not process task id=%s", task_uuid)
+            async with DB_POOL.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        UPDATE documents
+                        SET status = 'error', extracted_data = $1::jsonb
+                        WHERE task_id = $2
+                        """,
+                        json.dumps({"error": error_msg}, ensure_ascii=False),
+                        task_uuid,
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE calculations
+                        SET status = 'error'
+                        WHERE id = (
+                            SELECT calculation_id FROM documents
+                            WHERE task_id = $1 LIMIT 1
+                        )
+                        """,
+                        task_uuid,
+                    )
 
 async def main():
     global DB_POOL
-    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    conn = await aio_pika.connect_robust(CLOUDAMQP_URL)
-    async with conn:
-        channel = await conn.channel()
-        await channel.set_qos(prefetch_count=1)
-        queue = await channel.declare_queue("tender_tasks", durable=True)
-        await queue.consume(process_message)
-        await asyncio.Future()
+    if not CLOUDAMQP_URL:
+        raise RuntimeError("CLOUDAMQP_URL is not set")
+    DB_POOL = await create_database_pool()
+    try:
+        conn = await aio_pika.connect_robust(CLOUDAMQP_URL)
+        async with conn:
+            channel = await conn.channel()
+            await channel.set_qos(prefetch_count=1)
+            queue = await channel.declare_queue("tender_tasks", durable=True)
+            await queue.consume(process_message)
+            await asyncio.Future()
+    finally:
+        await DB_POOL.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

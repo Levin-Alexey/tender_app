@@ -1,184 +1,263 @@
+import json
+import logging
 import os
 import uuid
-import json
-import asyncio
-import urllib.parse
-from typing import List, Literal
-from fastapi import FastAPI, HTTPException, Security, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-import httpx
+from contextlib import asynccontextmanager
+from typing import Literal
+
 import aio_pika
 import asyncpg
-from contextlib import asynccontextmanager
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# Настройки
-DATABASE_URL = os.getenv("DATABASE_URL", "") # Сюда положишь ссылку на новый PostgreSQL
+from database import create_database_pool
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
 CLOUDAMQP_URL = os.getenv("CLOUDAMQP_URL", "")
-API_TOKEN = os.getenv("API_TOKEN", "my_secret_token_for_gpt")
+API_TOKEN = os.getenv("API_TOKEN", "")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Подключаемся к базе при старте HF Space
-    app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    yield
-    await app.state.pool.close()
+    if not API_TOKEN:
+        raise RuntimeError("API_TOKEN is not set")
+    app.state.pool = await create_database_pool()
+    try:
+        yield
+    finally:
+        await app.state.pool.close()
+
 
 app = FastAPI(title="Tender AI API", lifespan=lifespan)
 security = HTTPBearer()
+
 
 class DocumentInput(BaseModel):
     url: str
     name: str
 
+
 class AnalyzeRequest(BaseModel):
     client_name: str = "Неизвестный клиент"
     mode: Literal["analytics", "estimate"] = "analytics"
-    documents: List[DocumentInput]
+    documents: list[DocumentInput]
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != API_TOKEN:
+
+def verify_token(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+) -> str:
+    if not API_TOKEN or credentials.credentials != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
     return credentials.credentials
 
-async def send_to_queue(task_id: str, mode: str):
+
+async def send_to_queue(task_id: uuid.UUID, mode: str) -> None:
+    if not CLOUDAMQP_URL:
+        raise RuntimeError("CLOUDAMQP_URL is not set")
     connection = await aio_pika.connect_robust(CLOUDAMQP_URL)
     async with connection:
         channel = await connection.channel()
         queue = await channel.declare_queue("tender_tasks", durable=True)
-        message_body = json.dumps({
-            "task_id": task_id,
-            "mode": mode,
-        }).encode("utf-8")
+        message_body = json.dumps(
+            {"task_id": str(task_id), "mode": mode}
+        ).encode("utf-8")
         await channel.default_exchange.publish(
-            aio_pika.Message(body=message_body, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
+            aio_pika.Message(
+                body=message_body,
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            ),
             routing_key=queue.name,
         )
 
+
 @app.post("/api/v1/tenders/analyze", dependencies=[Depends(verify_token)])
 async def analyze_tenders(request: AnalyzeRequest):
+    seen_urls: set[str] = set()
+    document_inputs = []
+    for document in request.documents:
+        document_url = document.url.strip()
+        if document_url and document_url not in seen_urls:
+            seen_urls.add(document_url)
+            document_inputs.append((document_url, document.name))
+
+    if not document_inputs:
+        raise HTTPException(
+            status_code=400,
+            detail="В запросе нет валидных документов для обработки.",
+        )
+
+    pool: asyncpg.Pool = app.state.pool
+    calculation_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+
     try:
-        pool = app.state.pool
-        async with pool.acquire() as conn:
-            # Ищем или создаем клиента
-            client_record = await conn.fetchrow("SELECT id FROM clients WHERE name = $1", request.client_name)
-            if client_record:
-                db_client_id = client_record["id"]
-            else:
-                db_client_id = await conn.fetchval("INSERT INTO clients (name) VALUES ($1) RETURNING id", request.client_name)
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                client_id = await connection.fetchval(
+                    """
+                    INSERT INTO clients (name)
+                    VALUES ($1)
+                    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                    RETURNING id
+                    """,
+                    request.client_name,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO calculations (id, client_id, status)
+                    VALUES ($1, $2, 'pending')
+                    """,
+                    calculation_id,
+                    client_id,
+                )
+                await connection.executemany(
+                    """
+                    INSERT INTO documents (
+                        task_id, calculation_id, document_url, document_name,
+                        status, extracted_data
+                    )
+                    VALUES ($1, $2, $3, $4, 'pending', '{"stage":"queued"}'::jsonb)
+                    """,
+                    [
+                        (task_id, calculation_id, document_url, document_name)
+                        for document_url, document_name in document_inputs
+                    ],
+                )
+    except Exception as error:
+        logger.exception("Could not create analysis records")
+        raise HTTPException(
+            status_code=500, detail="Не удалось создать задачу анализа."
+        ) from error
 
-            calculation_id = str(uuid.uuid4())
-            await conn.execute("INSERT INTO calculations (id, client_id, status) VALUES ($1, $2, $3)", 
-                               calculation_id, db_client_id, "pending")
-
-            task_id = str(uuid.uuid4())
-            seen_urls = set()
-            docs_payload = []
-
-            for doc in request.documents:
-                doc_url = (doc.url or "").strip()
-                if not doc_url or doc_url in seen_urls:
-                    continue
-                seen_urls.add(doc_url)
-                # Готовим данные для вставки
-                docs_payload.append((
-                    task_id, calculation_id, doc_url, doc.name, "pending", json.dumps({"stage": "queued"})
-                ))
-
-            if not docs_payload:
-                raise HTTPException(status_code=400, detail="В запросе нет валидных документов.")
-
-            # Пакетная вставка документов с защитой от 409 (DO NOTHING)
-            await conn.executemany("""
-                INSERT INTO documents (task_id, calculation_id, document_url, document_name, status, extracted_data)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                ON CONFLICT (task_id) DO NOTHING
-            """, docs_payload)
-
+    try:
         await send_to_queue(task_id, request.mode)
+    except Exception as error:
+        logger.exception("Could not enqueue analysis task")
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    UPDATE documents
+                    SET status = 'error',
+                        extracted_data = '{"error":"Не удалось поставить задачу в очередь"}'::jsonb
+                    WHERE task_id = $1
+                    """,
+                    task_id,
+                )
+                await connection.execute(
+                    "UPDATE calculations SET status = 'error' WHERE id = $1",
+                    calculation_id,
+                )
+        raise HTTPException(
+            status_code=503, detail="Не удалось поставить задачу в очередь."
+        ) from error
 
-        return {
-            "batch_id": calculation_id,
-            "task_id": task_id,
-            "documents_total": len(docs_payload),
-            "message": f"Принято {len(docs_payload)} документов в пакет. Режим: {request.mode}",
-        }
+    return {
+        "batch_id": str(calculation_id),
+        "task_id": str(task_id),
+        "documents_total": len(document_inputs),
+        "message": (
+            f"Принято {len(document_inputs)} документов в пакет. "
+            f"Режим: {request.mode}"
+        ),
+    }
 
-    except Exception as e:
-        print(f"[API ERROR] {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Ошибка БД: {str(e)}")
 
-
-@app.get("/api/v1/tenders/status/{batch_id}", dependencies=[Depends(verify_token)])
-async def check_status(batch_id: str):
+@app.get(
+    "/api/v1/tenders/status/{batch_id}",
+    dependencies=[Depends(verify_token)],
+)
+async def check_status(batch_id: uuid.UUID):
+    pool: asyncpg.Pool = app.state.pool
     try:
-        pool = app.state.pool
-        async with pool.acquire() as conn:
-            documents = await conn.fetch("SELECT task_id, document_name, status, extracted_data::text FROM documents WHERE calculation_id = $1", batch_id)
+        async with pool.acquire() as connection:
+            documents = await connection.fetch(
+                """
+                SELECT task_id, document_name, status, extracted_data
+                FROM documents
+                WHERE calculation_id = $1
+                ORDER BY created_at, id
+                """,
+                batch_id,
+            )
+    except Exception as error:
+        logger.exception("Could not read calculation status")
+        raise HTTPException(
+            status_code=500, detail="Не удалось получить статус расчета."
+        ) from error
 
-        if not documents:
-            raise HTTPException(status_code=404, detail="Расчет не найден")
+    if not documents:
+        raise HTTPException(status_code=404, detail="Расчет не найден")
 
-        statuses = [doc["status"] for doc in documents]
-        total_docs = len(documents)
-        processing_statuses = {"pending", "processing"}
-        done_docs = sum(1 for s in statuses if s not in processing_statuses)
-        failed_docs = sum(1 for s in statuses if s == "error")
-        parsed_docs = sum(1 for s in statuses if s == "completed")
+    statuses = [document["status"] for document in documents]
+    total_docs = len(documents)
+    processing_statuses = {"pending", "processing"}
+    done_docs = sum(status not in processing_statuses for status in statuses)
+    failed_docs = statuses.count("error")
+    parsed_docs = statuses.count("completed")
 
-        docs_state = []
-        final_result = None
-        task_id = documents[0]["task_id"] if documents else None
-
-        for doc in documents:
-            extracted_raw = doc["extracted_data"]
-            extracted = json.loads(extracted_raw) if extracted_raw else {}
-            
-            if "final_result" in extracted:
-                final_result = extracted.get("final_result")
-
-            docs_state.append({
-                "document_name": doc["document_name"],
-                "status": doc["status"],
+    docs_state = []
+    final_result = None
+    task_id = documents[0]["task_id"]
+    for document in documents:
+        extracted = document["extracted_data"] or {}
+        if isinstance(extracted, str):
+            try:
+                extracted = json.loads(extracted)
+            except json.JSONDecodeError:
+                extracted = {}
+        if not isinstance(extracted, dict):
+            extracted = {}
+        if "final_result" in extracted:
+            final_result = extracted["final_result"]
+        docs_state.append(
+            {
+                "document_name": document["document_name"],
+                "status": document["status"],
                 "error": extracted.get("error"),
-            })
-
-        progress = {
-            "total_docs": total_docs, "done_docs": done_docs,
-            "parsed_docs": parsed_docs, "failed_docs": failed_docs,
-        }
-
-        if any(s in processing_statuses for s in statuses):
-            return {
-                "status": "processing", "task_id": task_id, "progress": progress,
-                "documents": docs_state, "message": "Документы еще обрабатываются..."
             }
+        )
 
-        if failed_docs > 0:
-            return {
-                "status": "error", "task_id": task_id, "progress": progress,
-                "documents": docs_state, "message": "Часть документов не обработана."
-            }
-
-        if final_result is None:
-            return {
-                "status": "processing", "task_id": task_id, "progress": progress,
-                "documents": docs_state, "message": "Документы обработаны, ожидается финальный расчет."
-            }
-
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE calculations SET status = 'completed' WHERE id = $1", batch_id)
-        except Exception:
-            pass
-
+    progress = {
+        "total_docs": total_docs,
+        "done_docs": done_docs,
+        "parsed_docs": parsed_docs,
+        "failed_docs": failed_docs,
+    }
+    if any(status in processing_statuses for status in statuses):
         return {
-            "status": "completed", "task_id": task_id, "progress": progress,
-            "documents": docs_state, "data": final_result,
+            "status": "processing",
+            "task_id": str(task_id),
+            "progress": progress,
+            "documents": docs_state,
+            "message": "Документы еще обрабатываются...",
+        }
+    if failed_docs:
+        return {
+            "status": "error",
+            "task_id": str(task_id),
+            "progress": progress,
+            "documents": docs_state,
+            "message": "Часть документов не обработана.",
+        }
+    if final_result is None:
+        return {
+            "status": "processing",
+            "task_id": str(task_id),
+            "progress": progress,
+            "documents": docs_state,
+            "message": "Документы обработаны, ожидается финальный расчет.",
         }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[API ERROR] 500: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "status": "completed",
+        "task_id": str(task_id),
+        "progress": progress,
+        "documents": docs_state,
+        "data": final_result,
+    }
