@@ -107,7 +107,7 @@ def _safe_filename_from_url_or_response(url: str, response: httpx.Response) -> s
 
 
 def extract_text_from_excel(file_path: str) -> str:
-    sheets = pd.read_excel(file_path, sheet_name=None, header=None, dtype=str)
+    sheets = pd.read_excel(file_path, sheet_name=None, header=None, dtype=str, engine='calamine')
     parts = []
     for sheet_name, df in sheets.items():
         df = df.fillna("")
