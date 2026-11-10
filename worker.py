@@ -149,6 +149,10 @@ async def call_smart_parser(file_path: str) -> str:
     try: response.raise_for_status()
     except httpx.HTTPStatusError as e: raise RuntimeError(f"Ошибка Unstructured API {response.status_code}: {response.text[:2000]}") from e
     elements = response.json()
+    if isinstance(elements, dict) and 'markdown' in elements:
+        return elements['markdown']
+    if isinstance(elements, dict) and 'elements' in elements:
+        elements = elements['elements']
     if not isinstance(elements, list): raise RuntimeError(f"Unstructured вернул неожиданный ответ: {elements}")
     return _elements_to_text(elements)
 
