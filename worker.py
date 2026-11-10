@@ -145,7 +145,7 @@ async def call_smart_parser(file_path: str) -> str:
 
     async with httpx.AsyncClient(timeout=timeout_config, follow_redirects=True) as http_client:
         with open(file_path, "rb") as f:
-            response = await http_client.post(UNSTRUCTURED_API_URL, headers=headers, data=data, files={"files": (filename, f, mime_type)})
+            response = await http_client.post(UNSTRUCTURED_API_URL, headers=headers, data=data, files={"input": (filename, f, mime_type)})
     try: response.raise_for_status()
     except httpx.HTTPStatusError as e: raise RuntimeError(f"Ошибка Unstructured API {response.status_code}: {response.text[:2000]}") from e
     elements = response.json()
